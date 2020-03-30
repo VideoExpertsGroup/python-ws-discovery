@@ -1,8 +1,13 @@
-#!/usr/bin/env python
+"""
+    ws-discovery.py :: https://github.com/hlamer/python-ws-discovery
 
-import urllib.request, urllib.parse, urllib.error
+    local changes:
+        * poll is emulated with select if not supported
+        * netifaces module is disabled for nt systems
+"""
+
 from xml.dom import minidom
-import io
+import StringIO
 import random
 import string
 import socket
@@ -10,30 +15,35 @@ import struct
 import time
 import uuid
 import threading
-import _thread
+import thread
 import sys
 import select
-import netifaces
+import urllib
 
+import os
+
+_use_netifaces = os.name != 'nt'
+if _use_netifaces:
+    import netifaces
 
 BUFFER_SIZE = 0xffff
-APP_MAX_DELAY = 500 # miliseconds
-DP_MAX_TIMEOUT = 5000 # 5 seconds
+APP_MAX_DELAY = 500  # miliseconds
+DP_MAX_TIMEOUT = 5000  # 5 seconds
 
-_NETWORK_ADDRESSES_CHECK_TIMEOUT = 5
+_NETWORK_ADDRESSES_CHECK_TIMEOUT = 10
 
 MULTICAST_PORT = 3702
 MULTICAST_IPV4_ADDRESS = "239.255.255.250"
 
-UNICAST_UDP_REPEAT=2
-UNICAST_UDP_MIN_DELAY=50
-UNICAST_UDP_MAX_DELAY=250
-UNICAST_UDP_UPPER_DELAY=500
+UNICAST_UDP_REPEAT = 2
+UNICAST_UDP_MIN_DELAY = 50
+UNICAST_UDP_MAX_DELAY = 250
+UNICAST_UDP_UPPER_DELAY = 500
 
-MULTICAST_UDP_REPEAT=4
-MULTICAST_UDP_MIN_DELAY=50
-MULTICAST_UDP_MAX_DELAY=250
-MULTICAST_UDP_UPPER_DELAY=500
+MULTICAST_UDP_REPEAT = 4
+MULTICAST_UDP_MIN_DELAY = 50
+MULTICAST_UDP_MAX_DELAY = 250
+MULTICAST_UDP_UPPER_DELAY = 500
 
 NS_A = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
 NS_D = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
@@ -54,10 +64,58 @@ MATCH_BY_URI = "http://schemas.xmlsoap.org/ws/2005/04/discovery/rfc2396"
 MATCH_BY_UUID = "http://schemas.xmlsoap.org/ws/2005/04/discovery/uuid"
 MATCH_BY_STRCMP = "http://schemas.xmlsoap.org/ws/2005/04/discovery/strcmp0"
 
+"""
+Use poll if supported by OS oe emulate
+"""
+_has_poll = hasattr(select, 'poll')
+if _has_poll:
+    import select as poll
+else:
+    class poll:
+        POLLIN = 1
 
-def _getNetworkAddrs():
+        @staticmethod
+        def poll():
+            return poll_emu()
+
+"""
+Emulate poll with select for OS where poll is not available (Windows)
+"""
+
+
+class poll_emu(object):
+    def __init__(self):
+        self._sockets = {poll.POLLIN: []}
+
+    def register(self, fd, eventmask=poll.POLLIN):
+        for ev in self._sockets:
+            if ev & eventmask:
+                sockets = self._sockets[ev]
+                if fd not in sockets:
+                    sockets.append(fd)
+
+    def unregister(self, fd):
+        for ev in self._sockets:
+            try:
+                self._sockets[ev].remove(fd)
+            except:
+                pass
+
+    def poll(self, timeout):
+        """
+        Windows generates error if no any socket is passed
+        also handle other exceptions
+        """
+        try:
+            readable, writable, exceptional = select.select(self._sockets[poll.POLLIN], [], [], timeout)
+            return [(fd, poll.POLLIN) for fd in readable]
+        except Exception as ex:
+            return []
+
+
+def _getNetworkAddrs_netif():
     result = []
-    
+
     for if_name in netifaces.interfaces():
         iface_info = netifaces.ifaddresses(if_name)
         if netifaces.AF_INET in iface_info:
@@ -66,6 +124,22 @@ def _getNetworkAddrs():
                 if addr != '127.0.0.1':
                     result.append(addr)
     return result
+
+
+def _getNetworkAddrs():
+    if _use_netifaces:
+        return _getNetworkAddrs_netif()
+
+    # IVP: The below code is copied from CNVR utils
+    ip_list = []
+
+    def append_ip(ip):
+        if ip != "127.0.0.1":
+            ip_list.append(ip)
+
+    for ip in socket.gethostbyname_ex('')[2]:  # socket.gethostname() and '' gives the same result on Windows
+        append_ip(ip)
+    return ip_list
 
 
 def _generateInstanceId():
@@ -77,11 +151,12 @@ class _StopableDaemonThread(threading.Thread):
     
     run() method shall exit, when self._quitEvent.wait() returned True
     """
+
     def __init__(self):
         self._quitEvent = threading.Event()
         super(_StopableDaemonThread, self).__init__()
         self.daemon = True
-   
+
     def schedule_stop(self):
         """Schedule stopping the thread.
         Use join() to wait, until thread really has been stopped
@@ -92,7 +167,7 @@ class _StopableDaemonThread(threading.Thread):
 class URI:
 
     def __init__(self, uri):
-        uri = urllib.parse.unquote(uri)
+        uri = urllib.unquote(uri)
         i1 = uri.find(":")
         i2 = uri.find("@")
         self._scheme = uri[:i1]
@@ -120,9 +195,10 @@ class URI:
         else:
             return path
 
+
 class QName:
 
-    def __init__(self, namespace, localname):        
+    def __init__(self, namespace, localname):
         self._namespace = namespace
         self._localname = localname
 
@@ -137,7 +213,7 @@ class QName:
 
     def __repr__(self):
         return self.getFullname()
-        
+
 
 class Scope:
 
@@ -153,12 +229,13 @@ class Scope:
 
     def getQuotedValue(self):
         return self._value.replace(' ', '%20')
-    
+
     def __repr__(self):
         if self.getMatchBy() == None or len(self.getMatchBy()) == 0:
             return self.getValue()
         else:
             return self.getMatchBy() + ":" + self.getValue()
+
 
 class ProbeResolveMatch:
 
@@ -168,7 +245,7 @@ class ProbeResolveMatch:
         self._scopes = scopes
         self._xAddrs = xAddrs
         self._metadataVersion = metadataVersion
-        
+
     def getEPR(self):
         return self._epr
 
@@ -186,8 +263,9 @@ class ProbeResolveMatch:
 
     def __repr__(self):
         return "EPR: %s\nTypes: %s\nScopes: %s\nXAddrs: %s\nMetadata Version: %s" % \
-            (self.getEPR(), self.getTypes(), self.getScopes(),
-             self.getXAddrs(), self.getMetadataVersion())
+               (self.getEPR(), self.getTypes(), self.getScopes(),
+                self.getXAddrs(), self.getMetadataVersion())
+
 
 class SoapEnvelope:
 
@@ -234,13 +312,13 @@ class SoapEnvelope:
 
     def getTo(self):
         return self._to
-    
+
     def setTo(self, to):
         self._to = to
 
     def getReplyTo(self):
         return self._replyTo
-    
+
     def setReplyTo(self, replyTo):
         self._replyTo = replyTo
 
@@ -255,7 +333,7 @@ class SoapEnvelope:
 
     def setSequenceId(self, sequenceId):
         self._sequenceId = sequenceId
-        
+
     def getEPR(self):
         return self._epr
 
@@ -325,8 +403,10 @@ def matchScope(src, target, matchBy):
     else:
         return False
 
+
 def matchType(type1, type2):
     return type1.getFullname() == type2.getFullname()
+
 
 def getNamespaceValue(node, prefix):
     while node != None:
@@ -337,6 +417,7 @@ def getNamespaceValue(node, prefix):
         node = node.parentNode
     return ""
 
+
 def getDefaultNamespace(node):
     while node != None:
         if node.nodeType == minidom.Node.ELEMENT_NODE:
@@ -346,6 +427,7 @@ def getDefaultNamespace(node):
         node = node.parentNode
     return ""
 
+
 def getQNameFromValue(value, node):
     vals = value.split(":")
     ns = ""
@@ -354,37 +436,42 @@ def getQNameFromValue(value, node):
         ns = getDefaultNamespace(node)
     else:
         localName = vals[1]
-        ns = getNamespaceValue(node, vals[0])              
+        ns = getNamespaceValue(node, vals[0])
     return QName(ns, localName)
+
 
 def _parseSpaceSeparatedList(node):
     if node.childNodes:
         return [item.replace('%20', ' ') \
-            for item in node.childNodes[0].data.split()]
+                for item in node.childNodes[0].data.split()]
     else:
         return []
 
+
 def getTypes(typeNode):
     return [getQNameFromValue(item, typeNode) \
-                for item in _parseSpaceSeparatedList(typeNode)]
+            for item in _parseSpaceSeparatedList(typeNode)]
+
 
 def getScopes(scopeNode):
     matchBy = scopeNode.getAttribute("MatchBy")
     return [Scope(item, matchBy) \
-                for item in _parseSpaceSeparatedList(scopeNode)]
+            for item in _parseSpaceSeparatedList(scopeNode)]
+
 
 def getXAddrs(xAddrsNode):
     return _parseSpaceSeparatedList(xAddrsNode)
+
 
 def createSkelSoapMessage(soapAction):
     doc = minidom.Document()
 
     envEl = doc.createElementNS(NS_S, "s:Envelope")
-    
+
     envEl.setAttribute("xmlns:a", NS_A)  # minidom does not insert this automatically
     envEl.setAttribute("xmlns:d", NS_D)
     envEl.setAttribute("xmlns:s", NS_S)
-    
+
     doc.appendChild(envEl)
 
     headerEl = doc.createElementNS(NS_S, "s:Header")
@@ -397,33 +484,43 @@ def createSkelSoapMessage(soapAction):
 
     return doc
 
-def addElementWithText(doc, parent, name, ns, value):
+
+def addElementWithText(doc, parent, name, ns, value, attributes={}):
     el = doc.createElementNS(ns, name)
     text = doc.createTextNode(value)
     el.appendChild(text)
+    for key in attributes:
+        el.setAttribute(key, attributes[key])
     parent.appendChild(el)
+
 
 def getDocAsString(doc):
     outStr = ""
-    stream = io.StringIO(outStr)
+    stream = StringIO.StringIO(outStr)
     stream.write(doc.toprettyxml())
     return stream.getvalue()
+
 
 def getBodyEl(doc):
     return doc.getElementsByTagNameNS(NS_S, "Body")[0]
 
+
 def getHeaderEl(doc):
     return doc.getElementsByTagNameNS(NS_S, "Header")[0]
+
 
 def getEnvEl(doc):
     return doc.getElementsByTagNameNS(NS_S, "Envelope")[0]
 
+
 def getRandomStr():
-    return "".join([random.choice(string.ascii_letters) for x in range(10)])
+    return "".join([random.choice(string.letters) for x in xrange(10)])
+
 
 def addNSAttrToEl(el, ns, prefix):
     el.setAttribute("xmlns:" + prefix, ns)
-    
+
+
 def addTypes(doc, node, types):
     if types is not None and len(types) > 0:
         envEl = getEnvEl(doc)
@@ -441,15 +538,18 @@ def addTypes(doc, node, types):
             typeList.append(prefix + ":" + localname)
         addElementWithText(doc, node, "d:Types", NS_D, " ".join(typeList))
 
+
 def addScopes(doc, node, scopes):
     if scopes is not None and len(scopes) > 0:
         addElementWithText(doc, node, "d:Scopes", NS_D, " ".join([x.getQuotedValue() for x in scopes]))
         if scopes[0].getMatchBy() is not None and len(scopes[0].getMatchBy()) > 0:
             node.getElementsByTagNameNS(NS_D, "Scopes")[0].setAttribute("MatchBy", scopes[0].getMatchBy())
 
+
 def addXAddrs(doc, node, xAddrs):
     if xAddrs is not len(xAddrs) > 0:
         addElementWithText(doc, node, "d:XAddrs", NS_D, " ".join([x for x in xAddrs]))
+
 
 def addEPR(doc, node, epr):
     eprEl = doc.createElementNS(NS_A, "a:EndpointReference")
@@ -464,7 +564,7 @@ def parseProbeMessage(dom):
 
     replyToNodes = dom.getElementsByTagNameNS(NS_A, "ReplyTo")
     if len(replyToNodes) > 0 and \
-       isinstance(replyToNodes[0].firstChild, minidom.Text):
+            isinstance(replyToNodes[0].firstChild, minidom.Text):
         env.setReplyTo(replyToNodes[0].firstChild.data.strip())
 
     env.setTo(dom.getElementsByTagNameNS(NS_A, "To")[0].firstChild.data.strip())
@@ -476,7 +576,7 @@ def parseProbeMessage(dom):
     scopeNodes = dom.getElementsByTagNameNS(NS_D, "Scopes")
     if len(scopeNodes) > 0:
         env.getScopes().extend(getScopes(scopeNodes[0]))
-    
+
     return env
 
 
@@ -502,7 +602,7 @@ def parseProbeMatchMessage(dom):
     pmNodes = dom.getElementsByTagNameNS(NS_D, "ProbeMatch")
     for node in pmNodes:
         epr = node.getElementsByTagNameNS(NS_A, "Address")[0].firstChild.data.strip()
-        
+
         types = []
         typeNodes = node.getElementsByTagNameNS(NS_D, "Types")
         if len(typeNodes) > 0:
@@ -512,23 +612,24 @@ def parseProbeMatchMessage(dom):
         scopeNodes = node.getElementsByTagNameNS(NS_D, "Scopes")
         if len(scopeNodes) > 0:
             scopes = getScopes(scopeNodes[0])
-            
+
         xAddrs = []
         xAddrNodes = node.getElementsByTagNameNS(NS_D, "XAddrs")
         if len(xAddrNodes) > 0:
             xAddrs = getXAddrs(xAddrNodes[0])
-        
+
         mdv = node.getElementsByTagNameNS(NS_D, "MetadataVersion")[0].firstChild.data.strip()
         env.getProbeResolveMatches().append(ProbeResolveMatch(epr, types, scopes, xAddrs, mdv))
-    
+
     return env
+
 
 def parseResolveMessage(dom):
     env = SoapEnvelope()
     env.setAction(ACTION_RESOLVE)
 
     env.setMessageId(dom.getElementsByTagNameNS(NS_A, "MessageID")[0].firstChild.data.strip())
-    
+
     replyToNodes = dom.getElementsByTagNameNS(NS_A, "ReplyTo")
     if len(replyToNodes) > 0:
         env.setReplyTo(replyToNodes[0].firstChild.data.strip())
@@ -537,6 +638,7 @@ def parseResolveMessage(dom):
     env.setEPR(dom.getElementsByTagNameNS(NS_A, "Address")[0].firstChild.data.strip())
 
     return env
+
 
 def parseResolveMatchMessage(dom):
     env = SoapEnvelope()
@@ -562,12 +664,13 @@ def parseResolveMatchMessage(dom):
         scopes = []
         if len(scopeNodes) > 0:
             scopes = getScopes(scopeNodes[0])
-                    
+
         xAddrs = getXAddrs(node.getElementsByTagNameNS(NS_D, "XAddrs")[0])
         mdv = node.getElementsByTagNameNS(NS_D, "MetadataVersion")[0].firstChild.data.strip()
         env.getProbeResolveMatches().append(ProbeResolveMatch(epr, types, scopes, xAddrs, mdv))
-    
+
     return env
+
 
 def parseHelloMessage(dom):
     env = SoapEnvelope()
@@ -583,7 +686,7 @@ def parseHelloMessage(dom):
         env.setRelatesTo(relatesToNodes[0].firstChild.data.strip())
         env.setRelationshipType(getQNameFromValue( \
             relatesToNodes[0].getAttribute("RelationshipType"), relatesToNodes[0]))
-    
+
     env.setEPR(dom.getElementsByTagNameNS(NS_A, "Address")[0].firstChild.data.strip())
 
     typeNodes = dom.getElementsByTagNameNS(NS_D, "Types")
@@ -597,10 +700,11 @@ def parseHelloMessage(dom):
     xNodes = dom.getElementsByTagNameNS(NS_D, "XAddrs")
     if len(xNodes) > 0:
         env.setXAddrs(getXAddrs(xNodes[0]))
-        
+
     env.setMetadataVersion(dom.getElementsByTagNameNS(NS_D, "MetadataVersion")[0].firstChild.data.strip())
-    
+
     return env
+
 
 def parseByeMessage(dom):
     env = SoapEnvelope()
@@ -610,22 +714,26 @@ def parseByeMessage(dom):
     env.setTo(dom.getElementsByTagNameNS(NS_A, "To")[0].firstChild.data.strip())
 
     _parseAppSequence(dom, env)
-    
+
     env.setEPR(dom.getElementsByTagNameNS(NS_A, "Address")[0].firstChild.data.strip())
-    
+
     return env
 
+
 def parseEnvelope(data, ipAddr):
+    #with open('c:/111.txt','a') as f:
+    #    f.write(data)
+    #    f.write('\n\n\n\n\n\n\n\n')
     try:
         dom = minidom.parseString(data)
     except Exception as ex:
-        #print >> sys.stderr, 'Failed to parse message from %s\n"%s": %s' % (ipAddr, data, ex)
+        # print >> sys.stderr, 'Failed to parse message from %s\n"%s": %s' % (ipAddr, data, ex)
         return None
-    
+
     if dom.getElementsByTagNameNS(NS_S, "Fault"):
-        #print >> sys.stderr, 'Fault received from %s:' % (ipAddr, data)
+        # print >> sys.stderr, 'Fault received from %s:' % (ipAddr, data)
         return None
-    
+
     soapAction = dom.getElementsByTagNameNS(NS_A, "Action")[0].firstChild.data.strip()
     if soapAction == ACTION_PROBE:
         return parseProbeMessage(dom)
@@ -640,6 +748,7 @@ def parseEnvelope(data, ipAddr):
     elif soapAction == ACTION_HELLO:
         return parseHelloMessage(dom)
 
+
 def createMessage(env):
     if env.getAction() == ACTION_PROBE:
         return createProbeMessage(env)
@@ -653,6 +762,7 @@ def createMessage(env):
         return createHelloMessage(env)
     if env.getAction() == ACTION_BYE:
         return createByeMessage(env)
+
 
 def createProbeMessage(env):
     doc = createSkelSoapMessage(ACTION_PROBE)
@@ -671,8 +781,8 @@ def createProbeMessage(env):
 
     addTypes(doc, probeEl, env.getTypes())
     addScopes(doc, probeEl, env.getScopes())
-    
     return getDocAsString(doc)
+
 
 def createProbeMatchMessage(env):
     doc = createSkelSoapMessage(ACTION_PROBE_MATCH)
@@ -699,11 +809,11 @@ def createProbeMatchMessage(env):
         addXAddrs(doc, probeMatchEl, probeMatch.getXAddrs())
         addElementWithText(doc, probeMatchEl, "d:MetadataVersion", NS_D, probeMatch.getMetadataVersion())
         probeMatchesEl.appendChild(probeMatchEl)
-    
-    
+
     bodyEl.appendChild(probeMatchesEl)
 
     return getDocAsString(doc)
+
 
 def createResolveMessage(env):
     doc = createSkelSoapMessage(ACTION_RESOLVE)
@@ -721,7 +831,8 @@ def createResolveMessage(env):
     addEPR(doc, resolveEl, env.getEPR())
     bodyEl.appendChild(resolveEl)
 
-    return getDocAsString(doc)   
+    return getDocAsString(doc)
+
 
 def createResolveMatchMessage(env):
     doc = createSkelSoapMessage(ACTION_RESOLVE_MATCH)
@@ -747,12 +858,13 @@ def createResolveMatchMessage(env):
         addScopes(doc, resolveMatchEl, resolveMatch.getScopes())
         addXAddrs(doc, resolveMatchEl, resolveMatch.getXAddrs())
         addElementWithText(doc, resolveMatchEl, "d:MetadataVersion", NS_D, resolveMatch.getMetadataVersion())
-        
+
         resolveMatchesEl.appendChild(resolveMatchEl)
 
     bodyEl.appendChild(resolveMatchesEl)
-    
+
     return getDocAsString(doc)
+
 
 def createHelloMessage(env):
     doc = createSkelSoapMessage(ACTION_HELLO)
@@ -782,8 +894,9 @@ def createHelloMessage(env):
     addElementWithText(doc, helloEl, "d:MetadataVersion", NS_D, env.getMetadataVersion())
 
     bodyEl.appendChild(helloEl)
-    
+
     return getDocAsString(doc)
+
 
 def createByeMessage(env):
     doc = createSkelSoapMessage(ACTION_BYE)
@@ -805,6 +918,7 @@ def createByeMessage(env):
 
     return getDocAsString(doc)
 
+
 def extractSoapUdpAddressFromURI(uri):
     val = uri.getPathExQueryFragment().split(":")
     part1 = val[0][2:]
@@ -823,19 +937,19 @@ class AddressMonitorThread(_StopableDaemonThread):
         self._wsd = wsd
         super(AddressMonitorThread, self).__init__()
         self._updateAddrs()
-    
+
     def _updateAddrs(self):
         addrs = set(_getNetworkAddrs())
-        
+
         disappeared = self._addrs.difference(addrs)
         new = addrs.difference(self._addrs)
-        
+
         for addr in disappeared:
             self._wsd._networkAddressRemoved(addr)
-        
+
         for addr in new:
             self._wsd._networkAddressAdded(addr)
-        
+
         self._addrs = addrs
 
     def run(self):
@@ -844,17 +958,18 @@ class AddressMonitorThread(_StopableDaemonThread):
 
 
 class NetworkingThread(_StopableDaemonThread):
+
     def __init__(self, observer):
         super(NetworkingThread, self).__init__()
-        
+
         self.setDaemon(True)
-        self._queue = []    # FIXME synchronisation
+        self._queue = []  # FIXME synchronisation
 
         self._knownMessageIds = set()
         self._iidMap = {}
         self._observer = observer
-        
-        self._poll = select.poll()
+
+        self._poll = poll.poll()
 
     @staticmethod
     def _makeMreq(addr):
@@ -862,38 +977,47 @@ class NetworkingThread(_StopableDaemonThread):
 
     @staticmethod
     def _createMulticastOutSocket(addr):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(0)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-        if addr is None:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.INADDR_ANY)
-        else:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(addr))
-        
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(0)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            if addr is None:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.INADDR_ANY)
+            else:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(addr))
+        except Exception as s:
+            # print >> sys.stderr, "Failed to create multicast socket for addr %s" % str(addr)
+            if sock:
+                sock.close()
+            sock = None
         return sock
 
     @staticmethod
     def _createMulticastInSocket():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         sock.bind(('', MULTICAST_PORT))
-    
+
         sock.setblocking(0)
-    
+
         return sock
-    
+
     def addSourceAddr(self, addr):
         """None means 'system default'"""
         try:
             self._multiInSocket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, self._makeMreq(addr))
         except socket.error:  # if 1 interface has more than 1 address, exception is raised for the second
             pass
-        
+
         sock = self._createMulticastOutSocket(addr)
+        if not sock:
+            return
+
         self._multiOutUniInSockets[addr] = sock
-        self._poll.register(sock, select.POLLIN)
-    
+        self._poll.register(sock, poll.POLLIN)
+
     def removeSourceAddr(self, addr):
         try:
             self._multiInSocket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, self._makeMreq(addr))
@@ -907,13 +1031,13 @@ class NetworkingThread(_StopableDaemonThread):
 
     def addUnicastMessage(self, env, addr, port, initialDelay=0):
         msg = Message(env, addr, port, Message.UNICAST, initialDelay)
-        
+
         self._queue.append(msg)
         self._knownMessageIds.add(env.getMessageId())
-    
+
     def addMulticastMessage(self, env, addr, port, initialDelay=0):
         msg = Message(env, addr, port, Message.MULTICAST, initialDelay)
-        
+
         self._queue.append(msg)
         self._knownMessageIds.add(env.getMessageId())
 
@@ -921,53 +1045,61 @@ class NetworkingThread(_StopableDaemonThread):
         while not self._quitEvent.is_set() or self._queue:
             self._sendPendingMessages()
             self._recvMessages()
-    
-    def _recvMessages(self):
-        for fd, event in self._poll.poll(0):
-            sock = socket.fromfd(fd, socket.AF_INET, socket.SOCK_DGRAM)
-            
-            try:
-                data, addr = sock.recvfrom(BUFFER_SIZE)
-            except socket.error as e:
-                time.sleep(0.01)
-                continue
-    
-            env = parseEnvelope(data, addr[0])
-        
-            if env is None: # fault or failed to parse
-                continue
-            
-            mid = env.getMessageId()
-            if mid in self._knownMessageIds:
-                continue
+
+    def _process_socket(self, sock):
+        try:
+            data, addr = sock.recvfrom(BUFFER_SIZE)
+        except socket.error, e:
+            time.sleep(0.01)
+            return
+
+        env = parseEnvelope(data, addr[0])
+
+        if env is None:  # fault or failed to parse
+            return
+
+        mid = env.getMessageId()
+        if mid in self._knownMessageIds:
+            return
+        else:
+            self._knownMessageIds.add(mid)
+
+        iid = env.getInstanceId()
+        mid = env.getMessageId()
+        if iid > 0:
+            mnum = env.getMessageNumber()
+            key = addr[0] + ":" + str(addr[1]) + ":" + str(iid)
+            if mid is not None and len(mid) > 0:
+                key = key + ":" + mid
+            if not self._iidMap.has_key(key):
+                self._iidMap[key] = iid
             else:
-                self._knownMessageIds.add(mid)
-            
-            iid = env.getInstanceId()
-            mid = env.getMessageId()
-            if len(iid) > 0 and int(iid) > 0:
-                mnum = env.getMessageNumber()
-                key = addr[0] + ":" + str(addr[1]) + ":" + str(iid)
-                if mid is not None and len(mid) > 0:
-                    key = key + ":" + mid
-                if key not in self._iidMap:
-                    self._iidMap[key] = iid
+                tmnum = self._iidMap[key]
+                if mnum > tmnum:
+                    self._iidMap[key] = mnum
                 else:
-                    tmnum = self._iidMap[key]
-                    if mnum > tmnum:
-                        self._iidMap[key] = mnum
-                    else:
-                        continue
-        
-            self._observer.envReceived(env, addr)
-    
+                    return
+
+        self._observer.envReceived(env, addr)
+
+    def _messages_poll(self):
+        for fd, event in self._poll.poll(0):
+            if _has_poll:
+                sock = socket.fromfd(fd, socket.AF_INET, socket.SOCK_DGRAM)
+            else:
+                sock = fd
+            self._process_socket(sock)
+
+    def _recvMessages(self):
+        return self._messages_poll()
+
     def _sendMsg(self, msg):
-        data = createMessage(msg.getEnv()).encode("UTF-8")
+        data = createMessage(msg.getEnv())
 
         if msg.msgType() == Message.UNICAST:
             self._uniOutSocket.sendto(data, (msg.getAddr(), msg.getPort()))
         else:
-            for sock in list(self._multiOutUniInSockets.values()):
+            for sock in self._multiOutUniInSockets.values():
                 sock.sendto(data, (msg.getAddr(), msg.getPort()))
 
     def _sendPendingMessages(self):
@@ -987,18 +1119,18 @@ class NetworkingThread(_StopableDaemonThread):
 
     def start(self):
         super(NetworkingThread, self).start()
-        
+
         self._uniOutSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
+
         self._multiInSocket = self._createMulticastInSocket()
         self._poll.register(self._multiInSocket)
-        
+
         self._multiOutUniInSockets = {}  # FIXME synchronisation
-        
+
     def join(self):
         super(NetworkingThread, self).join()
         self._uniOutSocket.close()
-        
+
         self._poll.unregister(self._multiInSocket)
         self._multiInSocket.close()
 
@@ -1013,19 +1145,19 @@ class Message:
         self._addr = addr
         self._port = port
         self._msgType = msgType
-        
+
         if msgType == self.UNICAST:
             udpRepeat, udpMinDelay, udpMaxDelay, udpUpperDelay = \
-                    UNICAST_UDP_REPEAT, \
-                    UNICAST_UDP_MIN_DELAY, \
-                    UNICAST_UDP_MAX_DELAY, \
-                    UNICAST_UDP_UPPER_DELAY
+                UNICAST_UDP_REPEAT, \
+                UNICAST_UDP_MIN_DELAY, \
+                UNICAST_UDP_MAX_DELAY, \
+                UNICAST_UDP_UPPER_DELAY
         else:
             udpRepeat, udpMinDelay, udpMaxDelay, udpUpperDelay = \
-                    MULTICAST_UDP_REPEAT, \
-                    MULTICAST_UDP_MIN_DELAY, \
-                    MULTICAST_UDP_MAX_DELAY, \
-                    MULTICAST_UDP_UPPER_DELAY
+                MULTICAST_UDP_REPEAT, \
+                MULTICAST_UDP_MIN_DELAY, \
+                MULTICAST_UDP_MAX_DELAY, \
+                MULTICAST_UDP_UPPER_DELAY
 
         self._udpRepeat = udpRepeat
         self._udpUpperDelay = udpUpperDelay
@@ -1040,10 +1172,10 @@ class Message:
 
     def getPort(self):
         return self._port
-    
+
     def msgType(self):
         return self._msgType
-    
+
     def isFinished(self):
         return self._udpRepeat <= 0
 
@@ -1057,6 +1189,7 @@ class Message:
             self._t = self._udpUpperDelay
         self._nextTime = int(time.time() * 1000) + self._t
         self._udpRepeat = self._udpRepeat - 1
+
 
 class Service:
 
@@ -1124,12 +1257,12 @@ class Service:
 
     def incrementMessageNumber(self):
         self._messageNumber = self._messageNumber + 1
-        
+
 
 class WSDiscovery:
 
     def __init__(self, uuid_=None):
-        
+
         self._networkingThread = None
         self._serverStarted = False
         self._remoteServices = {}
@@ -1138,16 +1271,16 @@ class WSDiscovery:
         self._dpActive = False
         self._dpAddr = None
         self._dpEPR = None
-        
+
         self._remoteServiceHelloCallback = None
         self._remoteServiceHelloCallbackTypesFilter = None
         self._remoteServiceHelloCallbackScopesFilter = None
         self._remoteServiceByeCallback = None
-        
+
         if uuid_ is not None:
             self.uuid = uuid_
         else:
-            self.uuid = uuid.uuid4().urn
+            self.uuid = uuid.uuid4().get_urn()
 
     def setRemoteServiceHelloCallback(self, cb, types=None, scopes=None):
         """Set callback, which will be called when new service appeared online
@@ -1182,55 +1315,56 @@ class WSDiscovery:
         self._remoteServices[service.getEPR()] = service
 
     def _removeRemoteService(self, epr):
-        if epr in self._remoteServices:
+        if self._remoteServices.has_key(epr):
             del self._remoteServices[epr]
 
-    def handleEnv(self, env, addr):        
+    def handleEnv(self, env, addr):
         if (env.getAction() == ACTION_PROBE_MATCH):
             for match in env.getProbeResolveMatches():
-                self._addRemoteService(Service(match.getTypes(), match.getScopes(), match.getXAddrs(), match.getEPR(), 0))
+                self._addRemoteService(
+                    Service(match.getTypes(), match.getScopes(), match.getXAddrs(), match.getEPR(), 0))
                 if match.getXAddrs() is None or len(match.getXAddrs()) == 0:
                     self._sendResolve(match.getEPR())
-                    
+
         elif env.getAction() == ACTION_RESOLVE_MATCH:
             for match in env.getProbeResolveMatches():
-                self._addRemoteService(Service(match.getTypes(), match.getScopes(), match.getXAddrs(), match.getEPR(), 0))
+                self._addRemoteService(
+                    Service(match.getTypes(), match.getScopes(), match.getXAddrs(), match.getEPR(), 0))
 
         elif env.getAction() == ACTION_PROBE:
-            services = self._filterServices(list(self._localServices.values()), env.getTypes(), env.getScopes())
+            services = self._filterServices(self._localServices.values(), env.getTypes(), env.getScopes())
             self._sendProbeMatch(services, env.getMessageId(), addr)
 
         elif env.getAction() == ACTION_RESOLVE:
-            if env.getEPR() in self._localServices:
+            if self._localServices.has_key(env.getEPR()):
                 service = self._localServices[env.getEPR()]
                 self._sendResolveMatch(service, env.getMessageId(), addr)
 
         elif env.getAction() == ACTION_HELLO:
-            #check if it is from a discovery proxy
+            # check if it is from a discovery proxy
             rt = env.getRelationshipType()
             if rt is not None and rt.getLocalname() == "Suppression" and rt.getNamespace() == NS_D:
                 xAddr = env.getXAddrs()[0]
-                #only support 'soap.udp'
+                # only support 'soap.udp'
                 if xAddr.startswith("soap.udp:"):
                     self._dpActive = True
                     self._dpAddr = extractSoapUdpAddressFromURI(URI(xAddr))
                     self._dpEPR = env.getEPR()
-
             service = Service(env.getTypes(), env.getScopes(), env.getXAddrs(), env.getEPR(), 0)
             self._addRemoteService(service)
             if self._remoteServiceHelloCallback is not None:
                 if self._matchesFilter(service,
-                                        self._remoteServiceHelloCallbackTypesFilter,
-                                        self._remoteServiceHelloCallbackScopesFilter):
+                                       self._remoteServiceHelloCallbackTypesFilter,
+                                       self._remoteServiceHelloCallbackScopesFilter):
                     self._remoteServiceHelloCallback(service)
 
         elif env.getAction() == ACTION_BYE:
-            #if the bye is from discovery proxy... revert back to multicasting
+            # if the bye is from discovery proxy... revert back to multicasting
             if self._dpActive and self._dpEPR == env.getEPR():
                 self._dpActive = False
                 self._dpAddr = None
                 self._dpEPR = None
-            
+
             self._removeRemoteService(env.getEPR())
             if self._remoteServiceByeCallback is not None:
                 self._remoteServiceByeCallback(env.getEPR())
@@ -1240,11 +1374,11 @@ class WSDiscovery:
 
     def _sendResolveMatch(self, service, relatesTo, addr):
         service.incrementMessageNumber()
-        
+
         env = SoapEnvelope()
         env.setAction(ACTION_RESOLVE_MATCH)
         env.setTo(ADDRESS_UNKNOWN)
-        env.setMessageId(uuid.uuid4().urn)
+        env.setMessageId(uuid.uuid4().get_urn())
         env.setInstanceId(str(service.getInstanceId()))
         env.setMessageNumber(str(service.getMessageNumber()))
         env.setRelatesTo(relatesTo)
@@ -1258,7 +1392,7 @@ class WSDiscovery:
         env = SoapEnvelope()
         env.setAction(ACTION_PROBE_MATCH)
         env.setTo(ADDRESS_UNKNOWN)
-        env.setMessageId(uuid.uuid4().urn)
+        env.setMessageId(uuid.uuid4().get_urn())
         random.seed((int)(time.time() * 1000000))
         env.setInstanceId(_generateInstanceId())
         env.setMessageNumber("1")
@@ -1267,7 +1401,8 @@ class WSDiscovery:
         for service in services:
             env.getProbeResolveMatches().append(ProbeResolveMatch(service.getEPR(), \
                                                                   service.getTypes(), service.getScopes(), \
-                                                                  service.getXAddrs(), str(service.getMetadataVersion())))
+                                                                  service.getXAddrs(),
+                                                                  str(service.getMetadataVersion())))
 
         self._networkingThread.addUnicastMessage(env, addr[0], addr[1], random.randint(0, APP_MAX_DELAY))
 
@@ -1275,10 +1410,9 @@ class WSDiscovery:
         env = SoapEnvelope()
         env.setAction(ACTION_PROBE)
         env.setTo(ADDRESS_ALL)
-        env.setMessageId(uuid.uuid4().urn)
+        env.setMessageId(uuid.uuid4().get_urn())
         env.setTypes(types)
         env.setScopes(scopes)
-
         if self._dpActive:
             self._networkingThread.addUnicastMessage(env, self._dpAddr[0], self._dpAddr[1])
         else:
@@ -1288,7 +1422,7 @@ class WSDiscovery:
         env = SoapEnvelope()
         env.setAction(ACTION_RESOLVE)
         env.setTo(ADDRESS_ALL)
-        env.setMessageId(uuid.uuid4().urn)
+        env.setMessageId(uuid.uuid4().get_urn())
         env.setEPR(epr)
 
         if self._dpActive:
@@ -1302,7 +1436,7 @@ class WSDiscovery:
         env = SoapEnvelope()
         env.setAction(ACTION_HELLO)
         env.setTo(ADDRESS_ALL)
-        env.setMessageId(uuid.uuid4().urn)
+        env.setMessageId(uuid.uuid4().get_urn())
         env.setInstanceId(str(service.getInstanceId()))
         env.setMessageNumber(str(service.getMessageNumber()))
         env.setTypes(service.getTypes())
@@ -1312,13 +1446,14 @@ class WSDiscovery:
 
         random.seed((int)(time.time() * 1000000))
 
-        self._networkingThread.addMulticastMessage(env, MULTICAST_IPV4_ADDRESS, MULTICAST_PORT, random.randint(0, APP_MAX_DELAY))
+        self._networkingThread.addMulticastMessage(env, MULTICAST_IPV4_ADDRESS, MULTICAST_PORT,
+                                                   random.randint(0, APP_MAX_DELAY))
 
     def _sendBye(self, service):
         env = SoapEnvelope()
         env.setAction(ACTION_BYE)
         env.setTo(ADDRESS_ALL)
-        env.setMessageId(uuid.uuid4().urn)
+        env.setMessageId(uuid.uuid4().get_urn())
         env.setInstanceId(str(service.getInstanceId()))
         env.setMessageNumber(str(service.getMessageNumber()))
         env.setEPR(service.getEPR())
@@ -1340,9 +1475,9 @@ class WSDiscovery:
         self._stopThreads()
         self._serverStarted = False
 
-    def  _networkAddressAdded(self, addr):
+    def _networkAddressAdded(self, addr):
         self._networkingThread.addSourceAddr(addr)
-        for service in list(self._localServices.values()):
+        for service in self._localServices.values():
             self._sendHello(service)
 
     def _networkAddressRemoved(self, addr):
@@ -1351,13 +1486,12 @@ class WSDiscovery:
     def _startThreads(self):
         if self._networkingThread is not None:
             return
-        
+
         self._networkingThread = NetworkingThread(self)
         self._networkingThread.start()
 
         self._addrsMonitorThread = AddressMonitorThread(self)
         self._addrsMonitorThread.start()
-    
 
     def _stopThreads(self):
         if self._networkingThread is None:
@@ -1365,24 +1499,24 @@ class WSDiscovery:
 
         self._networkingThread.schedule_stop()
         self._addrsMonitorThread.schedule_stop()
-        
+
         self._networkingThread.join()
         self._addrsMonitorThread.join()
-        
+
         self._networkingThread = None
 
     def _isTypeInList(self, ttype, types):
         for entry in types:
             if matchType(ttype, entry):
                 return True
-            
+
         return False
-    
+
     def _isScopeInList(self, scope, scopes):
         for entry in scopes:
             if matchScope(scope.getValue(), entry.getValue(), scope.getMatchBy()):
                 return True
-            
+
         return False
 
     def _matchesFilter(self, service, types, scopes):
@@ -1398,89 +1532,111 @@ class WSDiscovery:
 
     def _filterServices(self, services, types, scopes):
         return [service for service in services \
-                    if self._matchesFilter(service, types, scopes)]
+                if self._matchesFilter(service, types, scopes)]
 
     def clearRemoteServices(self):
         'clears remotely discovered services'
-        
+
         self._remoteServices.clear()
 
     def clearLocalServices(self):
         'send Bye messages for the services and remove them'
-        
-        for service in list(self._localServices.values()):
+
+        for service in self._localServices.values():
             self._sendBye(service)
 
         self._localServices.clear()
 
     def searchServices(self, types=None, scopes=None, timeout=3):
         'search for services given the TYPES and SCOPES in a given TIMEOUT'
-        
+
         if not self._serverStarted:
             raise Exception("Server not started")
 
         self._sendProbe(types, scopes)
-        
+
         time.sleep(timeout)
 
-        return self._filterServices(list(self._remoteServices.values()), types, scopes)
+        return self._filterServices(self._remoteServices.values(), types, scopes)
 
     def publishService(self, types, scopes, xAddrs):
         """Publish a service with the given TYPES, SCOPES and XAddrs (service addresses)
         
         if xAddrs contains item, which includes {ip} pattern, one item per IP addres will be sent
         """
-        
+
         if not self._serverStarted:
             raise Exception("Server not started")
-        
+
         instanceId = _generateInstanceId()
-        
+
         service = Service(types, scopes, xAddrs, self.uuid, instanceId)
         self._localServices[self.uuid] = service
         self._sendHello(service)
-        
+
         time.sleep(0.001)
- 
+
+
 def showEnv(env):
-    print("-----------------------------")
-    print("Action: %s" % env.getAction())
-    print("MessageId: %s" % env.getMessageId())
-    print("InstanceId: %s" % env.getInstanceId())
-    print("MessageNumber: %s" % env.getMessageNumber())
-    print("Reply To: %s" % env.getReplyTo())
-    print("To: %s" % env.getTo())
-    print("RelatesTo: %s" % env.getRelatesTo())
-    print("Relationship Type: %s" % env.getRelationshipType())
-    print("Types: %s" % env.getTypes())
-    print("Scopes: %s" % env.getScopes())
-    print("EPR: %s" % env.getEPR())
-    print("Metadata Version: %s" % env.getMetadataVersion())
-    print("Probe Matches: %s" % env.getProbeResolveMatches())
-    print("-----------------------------")
-    
-if __name__ == "__main__":
+    print "-----------------------------"
+    print "Action: %s" % env.getAction()
+    print "MessageId: %s" % env.getMessageId()
+    print "InstanceId: %s" % env.getInstanceId()
+    print "MessageNumber: %s" % env.getMessageNumber()
+    print "Reply To: %s" % env.getReplyTo()
+    print "To: %s" % env.getTo()
+    print "RelatesTo: %s" % env.getRelatesTo()
+    print "Relationship Type: %s" % env.getRelationshipType()
+    print "Types: %s" % env.getTypes()
+    print "Scopes: %s" % env.getScopes()
+    print "EPR: %s" % env.getEPR()
+    print "Metadata Version: %s" % env.getMetadataVersion()
+    print "Probe Matches: %s" % env.getProbeResolveMatches()
+    print "-----------------------------"
+
+def get_discovery_result(timeout):
     wsd = WSDiscovery()
     wsd.start()
 
-    ttype = QName("abc", "def")
-
-    ttype1 = QName("namespace", "myTestService")
-    scope1 = Scope("http://myscope")
-    ttype2 = QName("namespace", "myOtherTestService_type1")
-    scope2 = Scope("http://other_scope")
-    
-    xAddrs = ["localhost:8080/abc", '{ip}/device_service']
-    wsd.publishService(types=[ttype], scopes=[scope2], xAddrs=xAddrs)
-    
-    #ret = wsd.searchServices(scopes=[scope1], timeout=10)
-    
-    #nvt = QName("http://www.onvif.org/ver10/network/wsdl", "NetworkVideoTransmitter")
-    #ret = wsd.searchServices(types=[nvt])
-    
-    ret = wsd.searchServices()
-    
+    ret = wsd.searchServices(timeout=timeout)
+    response = []
     for service in ret:
-        print(service.getEPR() + ":" + service.getXAddrs()[0])
+        urls_device = service.getXAddrs()
+        if 'onvif' not in urls_device[0]:
+            continue
+        for ii in urls_device:
+            if '[' and ']' in ii:
+                urls_device.remove(ii)
+        object = {}
+        object['device']={}
+        object['device']['type'] = 'ONVIF'
+        object['urls'] = urls_device
+        response.append(object)
+    wsd.stop()
+    return response
 
+if __name__ == "__main__":
+
+    wsd = WSDiscovery()
+    wsd.start()
+
+
+    ret = wsd.searchServices()
+    response = []
+    i=0
+    for service in ret:
+        urls_device = service.getXAddrs()
+        if 'onvif' not in urls_device[0]:
+            continue
+        for ii in urls_device:
+            if '[' and ']' in ii:
+                urls_device.remove(ii)
+        device = {}
+        device['name']='test'+str(i)
+        device['type']='onvif'
+        device['firmware']='1.0'+str(i)
+        device['urls']=urls_device
+        response.append(device)
+        i=i+1
+    print response
     wsd.stop()
